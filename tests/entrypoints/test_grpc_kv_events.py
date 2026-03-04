@@ -16,6 +16,10 @@ from vllm.distributed.kv_events import (
 )
 from vllm.entrypoints.grpc_kv_events import GrpcKVEventBridge
 
+_ZMQ_SUB = zmq.SUB  # type: ignore[attr-defined]
+_ZMQ_DEALER = zmq.DEALER  # type: ignore[attr-defined]
+_ZMQ_SUBSCRIBE = zmq.SUBSCRIBE  # type: ignore[attr-defined]
+
 
 class _FakeServicerContext:
     def __init__(self) -> None:
@@ -40,16 +44,16 @@ class _FakeSocket:
         self.connected = endpoint
 
     def setsockopt_string(self, opt, value):
-        assert opt == zmq.SUBSCRIBE
+        assert opt == _ZMQ_SUBSCRIBE
         self.subscribed_topic = value
 
-    def send(self, payload):
+    async def send_multipart(self, payload):
         self.sent.append(payload)
 
-    def poll(self, _timeout):
+    async def poll(self, _timeout):
         return 1 if self.frames else 0
 
-    def recv_multipart(self):
+    async def recv_multipart(self):
         return self.frames.pop(0)
 
     def close(self, linger=0):
@@ -62,9 +66,9 @@ class _FakeZmqContext:
         self.replay_socket = replay_socket
 
     def socket(self, kind):
-        if kind == zmq.SUB:
+        if kind == _ZMQ_SUB:
             return self.sub_socket
-        if kind == zmq.REQ:
+        if kind == _ZMQ_DEALER:
             return self.replay_socket
         raise AssertionError(f"Unexpected socket kind: {kind}")
 
@@ -146,14 +150,17 @@ def test_convert_batch_handles_int_and_bytes_hashes_backwards_compatibility():
     assert [b.block_hash for b in stored0.stored.blocks] == [-(1 << 63) + 5, 42]
     assert [list(b.token_ids) for b in stored0.stored.blocks] == [[10, 11], [12, 13]]
     assert [b.lora_id for b in stored0.stored.blocks] == [7, 7]
+    assert [b.cache_level for b in stored0.stored.blocks] == [0, 0]
 
     stored1 = out.events[1]
     assert stored1.HasField("stored")
     assert stored1.stored.blocks[0].block_hash == -1
+    assert stored1.stored.blocks[0].cache_level == 0
 
     removed = out.events[2]
     assert removed.HasField("removed")
     assert list(removed.removed.block_hashes) == [-1, 9]
+    assert removed.removed.cache_level == 0
 
     cleared = out.events[3]
     assert cleared.HasField("cleared")
@@ -164,6 +171,32 @@ def test_convert_batch_handles_int_and_bytes_hashes_backwards_compatibility():
     # Event IDs stay in uint64 range even for large sequence numbers.
     big_seq_out = GrpcKVEventBridge._convert_batch((1 << 40) + 9, batch)
     assert big_seq_out.events[0].event_id == (9 << 32)
+
+
+def test_convert_batch_preserves_unknown_medium_as_unset_cache_level():
+    batch = InternalKVEventBatch(
+        ts=11.0,
+        data_parallel_rank=None,
+        events=[
+            BlockStored(
+                block_hashes=[1],
+                parent_block_hash=None,
+                token_ids=[1],
+                block_size=1,
+                lora_id=None,
+                medium="HBM",
+                lora_name=None,
+            ),
+            BlockRemoved(block_hashes=[1], medium="HBM"),
+        ],
+    )
+
+    out = GrpcKVEventBridge._convert_batch(5, batch)
+    stored = out.events[0].stored
+    removed = out.events[1].removed
+
+    assert not stored.blocks[0].HasField("cache_level")
+    assert not removed.HasField("cache_level")
 
 
 @pytest.mark.asyncio
@@ -203,9 +236,9 @@ async def test_stream_replay_then_live_with_sequence_filtering(monkeypatch):
 
     replay_socket = _FakeSocket(
         frames=[
-            (replay_seq_old, replay_payload_old),
-            (replay_seq_keep, replay_payload_keep),
-            (replay_end, b""),
+            (b"", replay_seq_old, replay_payload_old),
+            (b"", replay_seq_keep, replay_payload_keep),
+            (b"", replay_end, b""),
         ]
     )
     sub_socket = _FakeSocket(
@@ -220,14 +253,9 @@ async def test_stream_replay_then_live_with_sequence_filtering(monkeypatch):
     )
     fake_ctx = _FakeZmqContext(sub_socket=sub_socket, replay_socket=replay_socket)
 
-    async def _inline_to_thread(func, *args, **kwargs):
-        return func(*args, **kwargs)
-
     monkeypatch.setattr(
-        "vllm.entrypoints.grpc_kv_events.asyncio.to_thread", _inline_to_thread
-    )
-    monkeypatch.setattr(
-        "vllm.entrypoints.grpc_kv_events.zmq.Context.instance", lambda: fake_ctx
+        "vllm.entrypoints.grpc_kv_events.zmq.asyncio.Context.instance",
+        lambda: fake_ctx,
     )
 
     cfg = KVEventsConfig(
@@ -246,7 +274,7 @@ async def test_stream_replay_then_live_with_sequence_filtering(monkeypatch):
         if len(got) == 2:
             break
 
-    assert replay_socket.sent == [(3).to_bytes(8, byteorder="big", signed=False)]
+    assert replay_socket.sent == [(b"", (3).to_bytes(8, byteorder="big", signed=False))]
     assert [b.sequence_number for b in got] == [3, 4]
     assert [b.dp_rank for b in got] == [1, 3]
     assert sub_socket.subscribed_topic == "kv-events"
@@ -292,14 +320,9 @@ async def test_stream_replay_handles_high_bit_sequence_numbers(monkeypatch):
     )
     fake_ctx = _FakeZmqContext(sub_socket=sub_socket, replay_socket=replay_socket)
 
-    async def _inline_to_thread(func, *args, **kwargs):
-        return func(*args, **kwargs)
-
     monkeypatch.setattr(
-        "vllm.entrypoints.grpc_kv_events.asyncio.to_thread", _inline_to_thread
-    )
-    monkeypatch.setattr(
-        "vllm.entrypoints.grpc_kv_events.zmq.Context.instance", lambda: fake_ctx
+        "vllm.entrypoints.grpc_kv_events.zmq.asyncio.Context.instance",
+        lambda: fake_ctx,
     )
 
     cfg = KVEventsConfig(
@@ -319,3 +342,52 @@ async def test_stream_replay_handles_high_bit_sequence_numbers(monkeypatch):
             break
 
     assert [b.sequence_number for b in got] == [start_seq, start_seq + 1]
+
+
+@pytest.mark.asyncio
+async def test_stream_replay_idle_timeout_falls_back_to_live(monkeypatch):
+    replay_socket = _FakeSocket(frames=[])
+    live_payload = _encode_batch(
+        InternalKVEventBatch(
+            ts=1.0,
+            data_parallel_rank=0,
+            events=[AllBlocksCleared()],
+        )
+    )
+    sub_socket = _FakeSocket(
+        frames=[
+            (
+                b"kv-events",
+                (4).to_bytes(8, byteorder="big", signed=False),
+                live_payload,
+            ),
+        ]
+    )
+    fake_ctx = _FakeZmqContext(sub_socket=sub_socket, replay_socket=replay_socket)
+
+    monkeypatch.setattr(
+        "vllm.entrypoints.grpc_kv_events.zmq.asyncio.Context.instance",
+        lambda: fake_ctx,
+    )
+    monkeypatch.setattr(
+        "vllm.entrypoints.grpc_kv_events._REPLAY_IDLE_TIMEOUT_SECONDS", 0.0
+    )
+
+    cfg = KVEventsConfig(
+        enable_kv_cache_events=True,
+        publisher="zmq",
+        endpoint="tcp://localhost:5557",
+        replay_endpoint="tcp://localhost:5558",
+        topic="kv-events",
+    )
+    bridge = GrpcKVEventBridge(cfg)
+
+    context = _FakeServicerContext()
+    got = []
+    async for item in bridge.stream(start_sequence_number=3, context=context):
+        got.append(item)
+        if len(got) == 1:
+            break
+
+    assert replay_socket.sent == [(b"", (3).to_bytes(8, byteorder="big", signed=False))]
+    assert [b.sequence_number for b in got] == [4]

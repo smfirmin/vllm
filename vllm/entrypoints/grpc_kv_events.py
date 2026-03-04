@@ -7,13 +7,14 @@ Bridges vLLM's internal ZMQ KV event publisher to gRPC server-streaming.
 
 from __future__ import annotations
 
-import asyncio
+import time
 from collections.abc import AsyncGenerator
 from dataclasses import dataclass
 
 import grpc
 import msgspec
 import zmq
+import zmq.asyncio
 
 from vllm.config.kv_events import KVEventsConfig
 from vllm.distributed.kv_events import (
@@ -36,6 +37,15 @@ _MASK_64 = (1 << 64) - 1
 _INT64_SIGN_BIT = 1 << 63
 _INT64_MOD = 1 << 64
 _EVENT_ID_SEQ_MASK = (1 << 32) - 1
+_REPLAY_IDLE_TIMEOUT_SECONDS = 5.0
+_ZMQ_SUB = zmq.SUB  # type: ignore[attr-defined]
+_ZMQ_DEALER = zmq.DEALER  # type: ignore[attr-defined]
+_ZMQ_SUBSCRIBE = zmq.SUBSCRIBE  # type: ignore[attr-defined]
+_ZMQ_ERROR = zmq.ZMQError  # type: ignore[attr-defined]
+_CACHE_LEVEL_BY_MEDIUM = {
+    "GPU": 0,
+    "CPU": 1,
+}
 
 
 @dataclass(frozen=True)
@@ -94,78 +104,108 @@ class GrpcKVEventBridge:
         if self._config is None:
             return
 
-        sub_socket: zmq.Socket | None = None
-        replay_socket: zmq.Socket | None = None
+        sub_socket: zmq.asyncio.Socket | None = None
+        replay_socket: zmq.asyncio.Socket | None = None
 
         try:
-            zmq_ctx = zmq.Context.instance()
-            sub_socket = zmq_ctx.socket(zmq.SUB)
+            zmq_ctx = zmq.asyncio.Context.instance()
+            sub_socket = zmq_ctx.socket(_ZMQ_SUB)
             sub_socket.connect(self._config.endpoint)
-            sub_socket.setsockopt_string(zmq.SUBSCRIBE, self._config.topic)
+            sub_socket.setsockopt_string(_ZMQ_SUBSCRIBE, self._config.topic)
 
             last_seq = -1
 
             # Replay first, if requested and endpoint is configured.
             if start_sequence_number > 0 and self._config.replay_endpoint:
-                replay_socket = zmq_ctx.socket(zmq.REQ)
-                replay_socket.connect(self._config.replay_endpoint)
+                # Use DEALER for replay because server-side ROUTER can emit
+                # multiple replay responses for one request.
+                replay_socket = zmq_ctx.socket(_ZMQ_DEALER)
+                try:
+                    replay_socket.connect(self._config.replay_endpoint)
 
-                replay_req = int(start_sequence_number).to_bytes(
-                    _SEQ_BYTES, byteorder="big", signed=False
-                )
-                await asyncio.to_thread(replay_socket.send, replay_req)
-
-                while True:
-                    if self._context_cancelled(context):
-                        return
-
-                    if not await asyncio.to_thread(
-                        replay_socket.poll, _POLL_TIMEOUT_MS
-                    ):
-                        continue
-
-                    frames = await asyncio.to_thread(replay_socket.recv_multipart)
-                    if len(frames) != 2:
-                        logger.warning(
-                            "Invalid replay frame length: %s (expected 2)", len(frames)
-                        )
-                        continue
-
-                    seq_bytes, payload = frames
-                    if len(seq_bytes) != _SEQ_BYTES:
-                        logger.warning(
-                            "Invalid replay sequence length: %s (expected %s)",
-                            len(seq_bytes),
-                            _SEQ_BYTES,
-                        )
-                        continue
-
-                    if seq_bytes == ZmqEventPublisher.END_SEQ and not payload:
-                        break
-                    replay_seq = int.from_bytes(
-                        seq_bytes, byteorder="big", signed=False
+                    replay_req = int(start_sequence_number).to_bytes(
+                        _SEQ_BYTES, byteorder="big", signed=False
+                    )
+                    # ROUTER replay service expects [identity, empty, start_seq].
+                    await replay_socket.send_multipart((b"", replay_req))
+                    replay_idle_deadline = (
+                        time.monotonic() + _REPLAY_IDLE_TIMEOUT_SECONDS
                     )
 
-                    if replay_seq < start_sequence_number:
-                        continue
-                    if replay_seq <= last_seq:
-                        continue
+                    while True:
+                        if self._context_cancelled(context):
+                            return
 
-                    batch = self._decode_and_convert_batch(replay_seq, payload)
-                    if batch is None:
-                        continue
-                    last_seq = replay_seq
-                    yield batch
+                        if not await replay_socket.poll(_POLL_TIMEOUT_MS):
+                            if time.monotonic() >= replay_idle_deadline:
+                                logger.warning(
+                                    "Replay endpoint idle timeout after %.2fs "
+                                    "(start_sequence_number=%s, endpoint=%s). "
+                                    "Falling back to live stream.",
+                                    _REPLAY_IDLE_TIMEOUT_SECONDS,
+                                    start_sequence_number,
+                                    self._config.replay_endpoint,
+                                )
+                                break
+                            continue
+
+                        replay_idle_deadline = (
+                            time.monotonic() + _REPLAY_IDLE_TIMEOUT_SECONDS
+                        )
+                        frames = await replay_socket.recv_multipart()
+                        if len(frames) == 2:
+                            seq_bytes, payload = frames
+                        elif len(frames) == 3 and frames[0] == b"":
+                            _, seq_bytes, payload = frames
+                        else:
+                            logger.warning(
+                                "Invalid replay frame length: %s (expected 2 or 3)",
+                                len(frames),
+                            )
+                            continue
+
+                        if len(seq_bytes) != _SEQ_BYTES:
+                            logger.warning(
+                                "Invalid replay sequence length: %s (expected %s)",
+                                len(seq_bytes),
+                                _SEQ_BYTES,
+                            )
+                            continue
+
+                        if seq_bytes == ZmqEventPublisher.END_SEQ and not payload:
+                            break
+                        replay_seq = int.from_bytes(
+                            seq_bytes, byteorder="big", signed=False
+                        )
+
+                        if replay_seq < start_sequence_number:
+                            continue
+                        if replay_seq <= last_seq:
+                            continue
+
+                        batch = self._decode_and_convert_batch(replay_seq, payload)
+                        if batch is None:
+                            continue
+                        last_seq = replay_seq
+                        yield batch
+                except _ZMQ_ERROR as exc:
+                    logger.warning(
+                        "Replay unavailable (start_sequence_number=%s, endpoint=%s): "
+                        "%s. Falling back to live stream.",
+                        start_sequence_number,
+                        self._config.replay_endpoint,
+                        exc,
+                    )
 
             # Live stream.
             while True:
                 if self._context_cancelled(context):
                     return
 
-                if not await asyncio.to_thread(sub_socket.poll, _POLL_TIMEOUT_MS):
+                if not await sub_socket.poll(_POLL_TIMEOUT_MS):
                     continue
 
-                frames = await asyncio.to_thread(sub_socket.recv_multipart)
+                frames = await sub_socket.recv_multipart()
                 if len(frames) != 3:
                     logger.warning(
                         "Invalid SUB frame length: %s (expected 3)", len(frames)
@@ -246,6 +286,7 @@ class GrpcKVEventBridge:
     ) -> vllm_engine_pb2.KvCacheEvent:
         tokens = list(event.token_ids)
         block_size = max(int(event.block_size), 1)
+        cache_level = cls._cache_level_from_medium(event.medium)
 
         blocks: list[vllm_engine_pb2.KvBlock] = []
         for block_idx, block_hash in enumerate(event.block_hashes):
@@ -258,6 +299,8 @@ class GrpcKVEventBridge:
             )
             if event.lora_id is not None:
                 block.lora_id = event.lora_id
+            if cache_level is not None:
+                block.cache_level = cache_level
             blocks.append(block)
 
         stored = vllm_engine_pb2.KvBlocksStored(blocks=blocks)
@@ -272,6 +315,9 @@ class GrpcKVEventBridge:
         removed = vllm_engine_pb2.KvBlocksRemoved(
             block_hashes=[cls._to_signed_int64(h) for h in event.block_hashes]
         )
+        cache_level = cls._cache_level_from_medium(event.medium)
+        if cache_level is not None:
+            removed.cache_level = cache_level
         return vllm_engine_pb2.KvCacheEvent(event_id=event_id, removed=removed)
 
     @staticmethod
@@ -284,6 +330,12 @@ class GrpcKVEventBridge:
         if unsigned >= _INT64_SIGN_BIT:
             return unsigned - _INT64_MOD
         return unsigned
+
+    @staticmethod
+    def _cache_level_from_medium(medium: str | None) -> int | None:
+        if medium is None:
+            return None
+        return _CACHE_LEVEL_BY_MEDIUM.get(medium.upper())
 
     @staticmethod
     def _context_cancelled(context: grpc.aio.ServicerContext) -> bool:
